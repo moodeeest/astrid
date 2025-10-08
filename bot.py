@@ -16,7 +16,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 DISTRICTS = [
     "Мирзо-Улугбек", "Яшнабад", "Чиланзар", "Яккасарай",
     "Юнусабад", "Сергели", "Алмазар", "Янгихаят",
-    "Шайхантахур", "Мирабад", "Учтепа", "Янгихаёт"
+    "Шайхантахур", "Мирабад", "Бектемир", "Учтепа"
 ]
 
 # === CACHE & STATE ===
@@ -171,7 +171,7 @@ def handle_layout_selection(call, data):
     bot.send_photo(
         call.message.chat.id,
         layout["file_url"],
-        caption=f"Планировка {area}",
+        caption=f"Планировка {area} м²",
         reply_markup=markup
     )
     print(f"🏘️ Sent layout {area} for complex {id_complex}")
