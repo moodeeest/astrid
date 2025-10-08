@@ -19,10 +19,9 @@ DISTRICTS = [
     "Шайхантахур", "Мирабад"
 ]
 
-# === MEMORY STORAGE ===
-user_state = {}  # Tracks user pagination
-cache = {}       # Caches Supabase data temporarily
-
+# === CACHE & STATE ===
+cache = {}
+user_state = {}
 
 # === AUTO-CACHE CLEANER ===
 def clear_cache_loop():
@@ -35,23 +34,11 @@ def clear_cache_loop():
             print(f"🧹 Cleared {len(expired)} expired cache entries.")
         time.sleep(3600)
 
-
 threading.Thread(target=clear_cache_loop, daemon=True).start()
 
-
-# === START COMMAND ===
-@bot.message_handler(commands=["start"])
+# === START / SEARCH ===
+@bot.message_handler(commands=["start", "search"])
 def cmd_start(message):
-    bot.send_message(
-        message.chat.id,
-        "Здравствуйте! Чем могу помочь вам сегодня?"
-    )
-    print("Start command triggered")
-
-
-# === SEARCH COMMAND ===
-@bot.message_handler(commands=["search"])
-def cmd_search(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [types.InlineKeyboardButton(text=d, callback_data=d) for d in DISTRICTS]
     markup.add(*buttons)
@@ -62,16 +49,13 @@ def cmd_search(message):
     )
     print("Search command triggered")
 
-
-# === TALK TO MANAGER COMMAND ===
+# === TALK TO MANAGER ===
 @bot.message_handler(commands=["talk_to_manager"])
 def cmd_talk_manager(message):
     bot.send_message(
         message.chat.id,
         "Чтобы связаться с менеджером, напишите на телеграм: @sardorbatyrov"
     )
-    print("Talk to manager command triggered")
-
 
 # === CALLBACK HANDLER ===
 @bot.callback_query_handler(func=lambda call: True)
@@ -80,123 +64,126 @@ def handle_callback(call):
 
     if data in DISTRICTS:
         handle_district(call, data)
-    elif data in ["next", "prev"]:
-        handle_navigation(call)
+    else:
+        handle_layout_selection(call, data)
 
-
-# === HANDLE DISTRICT SELECTION ===
+# === HANDLE DISTRICT ===
 def handle_district(call, district):
     bot.answer_callback_query(call.id, f"Вы выбрали: {district}")
-    bot.send_message(call.message.chat.id, f"Ищу жилые комплексы в районе {district}...")
+    chat_id = call.message.chat.id
 
     # Check cache
     if district in cache and time.time() - cache[district]["time"] < 300:
-        rows = cache[district]["data"]
-        print(f"⚡ Using cached data for {district} ({len(rows)} rows)")
+        complexes = cache[district]["data"]
+        print(f"⚡ Using cached data for {district}")
     else:
-        rows = supabase.table("complexes").select("*").eq("district", district).execute().data
-        cache[district] = {"data": rows, "time": time.time()}
-        print(f"🌐 Fetched {len(rows)} rows from Supabase for {district}")
+        response = supabase.table("complexes").select("*").eq("district", district).execute()
+        complexes = response.data
+        cache[district] = {"data": complexes, "time": time.time()}
+        print(f"🌐 Loaded {len(complexes)} complexes for {district}")
 
-    if not rows:
-        bot.send_message(call.message.chat.id, "В этом районе пока нет комплексов.")
+    if not complexes:
+        bot.send_message(chat_id, "В этом районе пока нет комплексов.")
         return
 
-    # Group by id_complex
-    complexes = {}
-    for row in rows:
-        complexes.setdefault(row["id_complex"], []).append(row)
-    complexes_list = list(complexes.values())
+    # Use the first complex as the active one
+    first_complex = complexes[0]
+    id_complex = first_complex["id_complex"]
 
-    # Save user state
-    user_state[call.from_user.id] = {
-        "district": district,
-        "complexes": complexes_list,
-        "index": 0,
-        "message_ids": []
-    }
+    # Save state
+    user_state[call.from_user.id] = {"id_complex": id_complex, "district": district}
 
-    send_complex(call.message.chat.id, call.from_user.id, new_message=True)
+    # 1️⃣ Send renders
+    send_renders(chat_id, id_complex)
 
+    # 2️⃣ Wait 3 sec → Send caption
+    time.sleep(3)
+    caption = first_complex.get("caption", "Описание отсутствует.")
+    bot.send_message(chat_id, caption)
 
-# === SEND COMPLEX FUNCTION ===
-def send_complex(chat_id, user_id, new_message=False, edit=False):
-    state = user_state.get(user_id)
-    if not state:
-        bot.send_message(chat_id, "Пожалуйста, выберите район заново с помощью /start.")
+    # 3️⃣ Wait 3 sec → Show layouts
+    time.sleep(3)
+    show_layout_buttons(chat_id, id_complex)
+
+# === SEND RENDERS ===
+def send_renders(chat_id, id_complex):
+    response = supabase.table("renders").select("file_url").eq("id_complex", id_complex).execute()
+    renders = response.data
+
+    if not renders:
+        bot.send_message(chat_id, "Нет изображений рендера для этого комплекса.")
         return
 
-    complexes = state["complexes"]
-    index = state["index"]
-    current = complexes[index]
+    media = [types.InputMediaPhoto(r["file_url"]) for r in renders]
+    bot.send_media_group(chat_id, media)
+    print(f"📸 Sent {len(renders)} renders for {id_complex}")
 
-    caption = current[0]["caption"]
-    media = [types.InputMediaPhoto(item["file_url"], caption=caption if i == 0 else None)
-             for i, item in enumerate(current)]
+# === SHOW LAYOUT BUTTONS ===
+def show_layout_buttons(chat_id, id_complex):
+    response = supabase.table("layouts").select("area").eq("id_complex", id_complex).execute()
+    layouts = response.data
 
-    markup = types.InlineKeyboardMarkup()
-    buttons = []
-    if index > 0:
-        buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data="prev"))
-    if index < len(complexes) - 1:
-        buttons.append(types.InlineKeyboardButton("➡️ Далее", callback_data="next"))
+    if not layouts:
+        bot.send_message(chat_id, "Планировок для этого комплекса пока нет.")
+        return
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [types.InlineKeyboardButton(text=l["area"], callback_data=f"layout_{l['area']}") for l in layouts]
     markup.add(*buttons)
+    bot.send_message(chat_id, "У нас есть такие планировки в этом комплексе:", reply_markup=markup)
+    print(f"🏗️ Showing {len(layouts)} layouts for {id_complex}")
 
-    if new_message:
-        media_group = bot.send_media_group(chat_id, media)
-        text_msg = bot.send_message(
-            chat_id,
-            f"Проект {index + 1} из {len(complexes)}",
-            reply_markup=markup
-        )
-        state["message_ids"] = [m.message_id for m in media_group] + [text_msg.message_id]
-        print(f"✅ Sent complex {index + 1}/{len(complexes)}")
-
-    elif edit:
-        try:
-            for msg_id in state["message_ids"]:
-                bot.delete_message(chat_id, msg_id)
-            media_group = bot.send_media_group(chat_id, media)
-            text_msg = bot.send_message(
-                chat_id,
-                f"Проект {index + 1} из {len(complexes)}",
-                reply_markup=markup
-            )
-            state["message_ids"] = [m.message_id for m in media_group] + [text_msg.message_id]
-            print(f"🔄 Replaced with complex {index + 1}/{len(complexes)}")
-        except Exception as e:
-            print(f"Edit error: {e}")
-
-
-# === NAVIGATION HANDLER ===
-def handle_navigation(call):
+# === HANDLE LAYOUT SELECTION ===
+def handle_layout_selection(call, data):
     user_id = call.from_user.id
     state = user_state.get(user_id)
+
     if not state:
-        bot.answer_callback_query(call.id, "Сначала выберите район через /start")
+        bot.answer_callback_query(call.id, "Пожалуйста, начните заново с /search")
         return
 
-    if call.data == "next" and state["index"] < len(state["complexes"]) - 1:
-        state["index"] += 1
-    elif call.data == "prev" and state["index"] > 0:
-        state["index"] -= 1
-    else:
-        bot.answer_callback_query(call.id, "Нет больше проектов.")
+    if not data.startswith("layout_"):
+        bot.answer_callback_query(call.id)
+        return
+
+    area = data.replace("layout_", "")
+    id_complex = state["id_complex"]
+
+    response = (
+        supabase.table("layouts")
+        .select("file_url")
+        .eq("id_complex", id_complex)
+        .eq("area", area)
+        .execute()
+    )
+
+    layouts = response.data
+    if not layouts:
+        bot.answer_callback_query(call.id, "Нет изображения для этой планировки.")
         return
 
     bot.answer_callback_query(call.id)
-    send_complex(call.message.chat.id, user_id, edit=True)
 
+    # Send layout image with registration button
+    layout = layouts[0]
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📞 Регистрация", url="https://t.me/sardorbatyrov"))
+    bot.send_photo(
+        call.message.chat.id,
+        layout["file_url"],
+        caption=f"Планировка {area}",
+        reply_markup=markup
+    )
+    print(f"🏘️ Sent layout {area} for complex {id_complex}")
 
-# === FALLBACK HANDLER ===
+# === FALLBACK ===
 @bot.message_handler(func=lambda msg: True)
 def fallback(message):
     bot.send_message(
         message.chat.id,
-        "Неизвестная команда. Используйте /start, /search или /talk_to_manager"
+        "Неизвестная команда. Используйте /search или /talk_to_manager"
     )
 
-
-# === RUN BOT ===
+# === RUN ===
 print("Bot started ✅")
 bot.polling(none_stop=True)
